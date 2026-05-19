@@ -1,0 +1,6 @@
+flask
+websocket-client
+pandas
+numpy
+gunicorn
+requests
