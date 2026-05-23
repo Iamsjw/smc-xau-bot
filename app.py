@@ -149,6 +149,23 @@ st = {
     "api_warn_sent"  : False,
 }
 
+# ── Enhanced monitoring state ──────────────────────────────────
+ea_status = {
+    "last_seen"  : "Never",   # IST time EA last polled /signal
+    "connected"  : False,     # True if polled within last 10 min
+    "poll_count" : 0,         # total /signal calls since start
+}
+
+signal_history = []           # last 5 signals [{time, action, entry, sl, tp}]
+
+_sched = {
+    "heartbeat_date"       : None,   # date of last 9 AM heartbeat
+    "summary_date"         : None,   # date of last daily summary
+    "reopen_alerted"       : False,  # market reopen alert sent this cycle
+    "friday_warned"        : False,  # Friday close warning sent
+    "ea_disconnect_alerted": False,  # EA disconnect alert sent
+}
+
 # ══════════════════════════════════════════════════════════════
 #  TIME HELPERS
 # ══════════════════════════════════════════════════════════════
@@ -199,6 +216,22 @@ def is_market_open():
     if dow == 6 and t < 330:  # Sunday before 03:30 IST — still closed
         return False
     return True
+
+def kz_countdown():
+    """Returns a string showing time until the next kill zone."""
+    n = ist_now()
+    t = n.hour * 100 + n.minute
+    if CFG["london_open"] <= t <= CFG["london_close"]: return "🟡 London active"
+    if CFG["ny_open"]     <= t <= CFG["ny_close"]:     return "🔵 NY active"
+    def mins_until(hhmm):
+        h, m = divmod(hhmm, 100)
+        tgt = n.replace(hour=h, minute=m, second=0, microsecond=0)
+        if tgt <= n: tgt += timedelta(days=1)
+        return int((tgt - n).total_seconds() // 60)
+    lm, nm = mins_until(CFG["london_open"]), mins_until(CFG["ny_open"])
+    if lm < nm:
+        h, m = divmod(lm, 60); return f"⏳ London in {h}h {m}m"
+    h, m = divmod(nm, 60);     return f"⏳ NY in {h}h {m}m"
 
 def api_reset_date():
     """
@@ -335,6 +368,54 @@ def tg_missing_creds():
         tg(f"⚠️ <b>Missing Railway Variables</b>\n" +
            "\n".join(f"  • {m}" for m in missing) +
            f"\n🔧 Railway → Service → Variables")
+
+def tg_heartbeat():
+    tg(f"💓 <b>Bot Alive — Daily Check</b>\n"
+       f"━━━━━━━━━━━━━━━━\n"
+       f"📡 API calls: {api_calls['count']}/800\n"
+       f"📊 1m candles: {len(candles_1m)}\n"
+       f"🕐 {kz_countdown()}\n"
+       f"🤖 EA: {'✅ Connected' if ea_status['connected'] else '❌ Not seen yet'}\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
+
+def tg_daily_summary():
+    hist = signal_history[-5:] if signal_history else []
+    hist_text = "\n".join(f"  • {s['action']} @ {s['entry']} [{s['time']}]" for s in hist) or "  None today"
+    tg(f"📊 <b>Daily Summary</b>\n"
+       f"━━━━━━━━━━━━━━━━\n"
+       f"📅 {ist_now().strftime('%d %b %Y')}\n"
+       f"📌 Trade active: <b>{'Yes 🔴' if trade_active else 'No'}</b>\n"
+       f"📡 API calls used: {api_calls['count']}/800\n"
+       f"📈 Signals generated:\n{hist_text}\n"
+       f"🤖 EA: {'✅ Connected' if ea_status['connected'] else '❌ Check MT5'}\n"
+       f"━━━━━━━━━━━━━━━━\n"
+       f"🤖 SMC+XAU Bot v7")
+
+def tg_market_reopen():
+    tg(f"🟢 <b>Market Open — New Week!</b>\n"
+       f"━━━━━━━━━━━━━━━━\n"
+       f"📅 {ist_now().strftime('%A %d %b')}\n"
+       f"🥇 Gold trading has resumed\n"
+       f"🟡 London Kill Zone: 12:30 IST\n"
+       f"🔵 NY Kill Zone    : 17:30 IST\n"
+       f"📡 API calls reset: {api_calls['count']}/800\n"
+       f"🤖 SMC+XAU Bot v7 — Ready! 🚀")
+
+def tg_friday_warning():
+    tg(f"⚠️ <b>Market Closes Soon — Friday</b>\n"
+       f"━━━━━━━━━━━━━━━━\n"
+       f"📅 Gold closes ~03:30 IST Saturday\n"
+       f"📡 API calls today: {api_calls['count']}/800\n"
+       f"💤 Bot will sleep all weekend\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
+
+def tg_ea_disconnect():
+    tg(f"⚠️ <b>EA May Be Disconnected</b>\n"
+       f"━━━━━━━━━━━━━━━━\n"
+       f"🔴 No poll from MT5 EA in 10+ minutes\n"
+       f"💡 Check MetaTrader 5 is running\n"
+       f"💡 Check EA is attached to XAUUSD chart\n"
+       f"⏰ Last seen: {ea_status['last_seen']}")
 
 # ══════════════════════════════════════════════════════════════
 #  API CALL TRACKER — hard stop, no spam
@@ -818,6 +899,52 @@ def bot_loop():
                 _weekend_alerted = False   # reset when market reopens
             # ───────────────────────────────────────────────────────
 
+            # ── Scheduling checks (heartbeat / summary / alerts) ──
+            today = now.date()
+            ti    = now.hour * 100 + now.minute
+            dow   = now.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+
+            # 9 AM heartbeat
+            if now.hour == 9 and now.minute < 2 and _sched["heartbeat_date"] != today:
+                _sched["heartbeat_date"] = today
+                tg_heartbeat()
+
+            # Daily summary after NY closes (20:32 IST)
+            if ti >= 2032 and _sched["summary_date"] != today:
+                _sched["summary_date"] = today
+                tg_daily_summary()
+
+            # Friday close warning at 02:55 IST
+            if dow == 4 and ti >= 255 and ti < 340 and not _sched["friday_warned"]:
+                _sched["friday_warned"] = True
+                tg_friday_warning()
+            if dow != 4:
+                _sched["friday_warned"] = False
+
+            # Market reopen alert Sunday 03:30+ IST
+            if dow == 6 and ti >= 330 and not _sched["reopen_alerted"]:
+                _sched["reopen_alerted"] = True
+                tg_market_reopen()
+            if dow == 0:
+                _sched["reopen_alerted"] = False
+
+            # EA disconnect alert — only during kill zone, only once
+            if is_kz() and ea_status["last_seen"] != "Never":
+                try:
+                    ls = datetime.strptime(ea_status["last_seen"], "%H:%M:%S IST")
+                    ls = now.replace(hour=ls.hour, minute=ls.minute, second=ls.second)
+                    if (now - ls).total_seconds() > 600:
+                        ea_status["connected"] = False
+                        if not _sched["ea_disconnect_alerted"]:
+                            _sched["ea_disconnect_alerted"] = True
+                            tg_ea_disconnect()
+                    else:
+                        ea_status["connected"] = True
+                        _sched["ea_disconnect_alerted"] = False
+                except Exception:
+                    pass
+            # ─────────────────────────────────────────────────────
+
             kz  = kz_name()
             bot_status["kill_zone"]  = kz
             bot_status["last_check"] = now.strftime("%H:%M:%S IST")
@@ -916,6 +1043,12 @@ def _update_signal(sig):
     current_signal["timestamp"] = ist_now().strftime("%H:%M:%S IST")
     current_signal["consumed"]  = False
     log.info(f"📡 Signal updated → {sig['action']} entry={sig['entry']} sl={sig['sl']} tp={sig['tp']}")
+    # Keep last 5 signals in history
+    signal_history.append({"time": ist_now().strftime("%H:%M IST"),
+                            "action": sig["action"], "entry": sig["entry"],
+                            "sl": sig["sl"], "tp": sig["tp"]})
+    if len(signal_history) > 5:
+        signal_history.pop(0)
 
 def _clear_signal():
     """Reset signal to NONE after EA has consumed it."""
@@ -962,6 +1095,17 @@ def status():
         ("MT5 Login",     MT5_LOGIN or "❌ Add MT5_LOGIN",                          "#e6edf3"),
         ("Telegram",      "✅" if TG_TOKEN and TG_CHAT else "❌ Add TG vars",       "#e6edf3"),
         ("Last Error",    bot_status["error"],                                      "#f85149"),
+        ("── EA ──",      "",                                                         "#21262d"),
+        ("EA Last Seen",  ea_status["last_seen"],                                    "#3fb950" if ea_status["connected"] else "#f85149"),
+        ("EA Connected",  "✅ Yes" if ea_status["connected"] else "❌ Not seen",    "#3fb950" if ea_status["connected"] else "#f85149"),
+        ("EA Poll Count", str(ea_status["poll_count"]),                              "#e6edf3"),
+        ("Next KZ",       kz_countdown(),                                            "#e3b341"),
+        ("── Signals ──", "",                                                         "#21262d"),
+    ] + [(f"Signal {i+1}",
+          f"{s['action']} @ {s['entry']} SL:{s['sl']} TP:{s['tp']} [{s['time']}]",
+          "#3fb950" if s['action']=="BUY" else "#f85149")
+         for i, s in enumerate(signal_history[-5:])] + [
+        ("─────────",    "",                                                          "#21262d"),
     ]
     rows_html = "".join(
         f'<tr><td style="padding:6px 12px;color:#8b949e;border-bottom:1px solid #21262d;white-space:nowrap">{l}</td>'
@@ -983,8 +1127,17 @@ def status():
 @flask_app.route("/api/status")
 @flask_app.route("/status")
 def api_s():
-    return jsonify({**bot_status,"kz":is_kz(),"ist":ist_now().strftime("%H:%M:%S"),
-                    "trade":trade_active,"api_exhausted":st.get("api_exhausted",False)})
+    return jsonify({**bot_status,
+                    "kz"            : is_kz(),
+                    "kz_countdown"  : kz_countdown(),
+                    "ist"           : ist_now().strftime("%H:%M:%S"),
+                    "trade"         : trade_active,
+                    "api_exhausted" : st.get("api_exhausted", False),
+                    "ea_last_seen"  : ea_status["last_seen"],
+                    "ea_connected"  : ea_status["connected"],
+                    "ea_poll_count" : ea_status["poll_count"],
+                    "signal_history": signal_history[-5:],
+                    })
 
 # ── /signal  — MQL5 EA polls this every tick ──────────────────
 @flask_app.route("/signal")
@@ -997,6 +1150,11 @@ def get_signal():
         "entry": float, "sl": float, "tp": float,
         "timestamp": str, "consumed": bool }
     """
+    # Track EA connectivity on every poll
+    ea_status["last_seen"]   = ist_now().strftime("%H:%M:%S IST")
+    ea_status["connected"]   = True
+    ea_status["poll_count"] += 1
+    _sched["ea_disconnect_alerted"] = False   # reset disconnect flag
     return jsonify(current_signal)
 
 # ── /signal/consumed  — EA calls after placing trade ──────────
