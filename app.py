@@ -121,6 +121,17 @@ bot_status = {
     "consecutive_err": 0,
 }
 
+# ── Signal state — polled by MQL5 EA ──────────────────────────
+# EA polls GET /signal and reads this dict.
+current_signal = {
+    "action"    : "NONE",   # "BUY", "SELL", or "NONE"
+    "entry"     : 0.0,
+    "sl"        : 0.0,
+    "tp"        : 0.0,
+    "timestamp" : "—",      # IST time signal was generated
+    "consumed"  : False,    # EA sets this True after placing trade (via /signal/consumed)
+}
+
 st = {
     # Strategy state
     "bull_sweep_bar" : -999, "bear_sweep_bar" : -999,
@@ -575,13 +586,21 @@ def run_strategy():
             sl=l-atr_v*CFG["sl_atr_mult"]; tp=c+abs(c-sl)*CFG["rr_ratio"]
             st["last_bull_alert"]=100
             log.info(f"🚀 LONG entry:{c:.2f} sl:{sl:.2f} tp:{tp:.2f}")
-            return {"action":"BUY","entry":c,"sl":sl,"tp":tp}
+            sig = {"action":"BUY","entry":c,"sl":round(sl,2),"tp":round(tp,2)}
+            _update_signal(sig)
+            return sig
 
         if all(short_conds.values()) and not trade_active:
             sl=h+atr_v*CFG["sl_atr_mult"]; tp=c-abs(sl-c)*CFG["rr_ratio"]
             st["last_bear_alert"]=100
             log.info(f"🔻 SHORT entry:{c:.2f} sl:{sl:.2f} tp:{tp:.2f}")
-            return {"action":"SELL","entry":c,"sl":sl,"tp":tp}
+            sig = {"action":"SELL","entry":c,"sl":round(sl,2),"tp":round(tp,2)}
+            _update_signal(sig)
+            return sig
+
+        # No signal — reset to NONE if previous was consumed
+        if current_signal["consumed"]:
+            _clear_signal()
 
         return None
 
@@ -848,12 +867,42 @@ def bot_loop():
         time.sleep(CFG["check_every_sec"])
 
 # ══════════════════════════════════════════════════════════════
+#  SIGNAL HELPERS
+# ══════════════════════════════════════════════════════════════
+def _update_signal(sig):
+    """Write a new BUY/SELL signal — called from run_strategy()."""
+    current_signal["action"]    = sig["action"]
+    current_signal["entry"]     = sig["entry"]
+    current_signal["sl"]        = sig["sl"]
+    current_signal["tp"]        = sig["tp"]
+    current_signal["timestamp"] = ist_now().strftime("%H:%M:%S IST")
+    current_signal["consumed"]  = False
+    log.info(f"📡 Signal updated → {sig['action']} entry={sig['entry']} sl={sig['sl']} tp={sig['tp']}")
+
+def _clear_signal():
+    """Reset signal to NONE after EA has consumed it."""
+    current_signal["action"]    = "NONE"
+    current_signal["entry"]     = 0.0
+    current_signal["sl"]        = 0.0
+    current_signal["tp"]        = 0.0
+    current_signal["timestamp"] = "—"
+    current_signal["consumed"]  = False
+    log.info("📡 Signal cleared → NONE")
+
+# ══════════════════════════════════════════════════════════════
 #  FLASK STATUS PAGE
 # ══════════════════════════════════════════════════════════════
 flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def status():
+    sig_color = "#3fb950" if current_signal["action"]=="BUY" \
+                else ("#f85149" if current_signal["action"]=="SELL" else "#484f58")
+    sig_text  = (f"{current_signal['action']} @ {current_signal['entry']} "
+                 f"SL:{current_signal['sl']} TP:{current_signal['tp']} "
+                 f"[{current_signal['timestamp']}] "
+                 f"{'✅ Consumed' if current_signal['consumed'] else '⏳ Waiting EA'}"
+                 ) if current_signal["action"] != "NONE" else "NONE"
     rows = [
         ("Status",        "✅ Running" if bot_status["running"] else "⏳ Starting", "#3fb950"),
         ("IST Time",      ist_now().strftime("%H:%M:%S"),                           "#e3b341"),
@@ -863,6 +912,7 @@ def status():
         ("1m Candles",    str(bot_status["candles_1m"]),                            "#e6edf3"),
         ("API Calls",     bot_status["api_calls"] + (" 🔴 PAUSED" if st.get("api_exhausted") else ""), "#e3b341"),
         ("Volume",        bot_status["volume_info"],                                "#e6edf3"),
+        ("EA Signal",     sig_text,                                                 sig_color),
         ("Last Signal",   bot_status["last_signal"],                                "#58a6ff"),
         ("Last TG Alert", bot_status["last_alert"],                                 "#a78bfa"),
         ("Trade Active",  "🔴 YES" if trade_active else "⚪ No",                   "#e6edf3"),
@@ -896,6 +946,30 @@ def status():
 def api_s():
     return jsonify({**bot_status,"kz":is_kz(),"ist":ist_now().strftime("%H:%M:%S"),
                     "trade":trade_active,"api_exhausted":st.get("api_exhausted",False)})
+
+# ── /signal  — MQL5 EA polls this every tick ──────────────────
+@flask_app.route("/signal")
+def get_signal():
+    """
+    Returns the current trading signal as JSON.
+    The MQL5 EA calls this URL every tick.
+    Response:
+      { "action": "BUY"|"SELL"|"NONE",
+        "entry": float, "sl": float, "tp": float,
+        "timestamp": str, "consumed": bool }
+    """
+    return jsonify(current_signal)
+
+# ── /signal/consumed  — EA calls after placing trade ──────────
+@flask_app.route("/signal/consumed", methods=["POST","GET"])
+def mark_consumed():
+    """
+    EA calls this after successfully placing the trade.
+    Marks signal as consumed so bot doesn't re-trigger.
+    """
+    current_signal["consumed"] = True
+    log.info("✅ Signal marked consumed by EA")
+    return jsonify({"ok": True})
 
 if __name__ == "__main__":
     threading.Thread(target=bot_loop, daemon=True).start()
