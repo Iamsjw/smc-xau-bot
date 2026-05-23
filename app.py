@@ -185,6 +185,21 @@ def kz_name():
     if is_warmup_window():                              return "⏳ Warming up..."
     return "⚫ Outside kill zone"
 
+def is_market_open():
+    """
+    Gold/Forex market closes Friday ~22:00 UTC (Sat 03:30 IST)
+    and reopens Sunday ~22:00 UTC (Mon 03:30 IST).
+    Returns False on Saturday all day and Sunday before 03:30 IST.
+    """
+    n   = ist_now()
+    dow = n.weekday()   # 0=Mon … 4=Fri, 5=Sat, 6=Sun
+    t   = n.hour * 100 + n.minute
+    if dow == 5:          # Saturday — market fully closed
+        return False
+    if dow == 6 and t < 330:  # Sunday before 03:30 IST — still closed
+        return False
+    return True
+
 def api_reset_date():
     """
     Twelve Data resets at ~5:30 AM IST daily.
@@ -777,9 +792,32 @@ def bot_loop():
     log.info(f"✅ Bot ready | {len(candles_1m)} × 1m candles | {len(candles_1h)} × 1H candles")
     tg_started()
 
+    _weekend_alerted = False   # track one-time weekend alert
+
     while True:
         try:
             now = ist_now()
+
+            # ── Weekend / market-closed guard ──────────────────────
+            if not is_market_open():
+                dow_name = now.strftime("%A")
+                log.info(f"🔴 Market closed ({dow_name}) — sleeping 30 min")
+                bot_status["kill_zone"]  = f"🔴 Market Closed ({dow_name})"
+                bot_status["last_check"] = now.strftime("%H:%M:%S IST")
+                if not _weekend_alerted:
+                    tg(f"🔴 <b>Market Closed — Weekend</b>\n"
+                       f"━━━━━━━━━━━━━━━━\n"
+                       f"📅 {dow_name} — Gold market is closed\n"
+                       f"💤 Bot sleeping, no signals will be sent\n"
+                       f"⏰ Reopens Monday ~03:30 IST\n"
+                       f"🤖 SMC+XAU Bot v7", silent=True)
+                    _weekend_alerted = True
+                time.sleep(1800)   # sleep 30 minutes, check again
+                continue
+            else:
+                _weekend_alerted = False   # reset when market reopens
+            # ───────────────────────────────────────────────────────
+
             kz  = kz_name()
             bot_status["kill_zone"]  = kz
             bot_status["last_check"] = now.strftime("%H:%M:%S IST")
