@@ -943,6 +943,7 @@ def status():
     </body></html>""", 200
 
 @flask_app.route("/api/status")
+@flask_app.route("/status")
 def api_s():
     return jsonify({**bot_status,"kz":is_kz(),"ist":ist_now().strftime("%H:%M:%S"),
                     "trade":trade_active,"api_exhausted":st.get("api_exhausted",False)})
