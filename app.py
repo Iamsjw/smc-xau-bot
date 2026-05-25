@@ -22,6 +22,7 @@ Railway Variables needed:
 """
 
 import json, time, threading, logging, os, traceback
+MAX_SIGNAL_AGE_SEC = 5     # signals older than this are treated as stale/expired
 import requests
 from datetime import datetime, timezone, timedelta
 from collections import deque
@@ -125,12 +126,13 @@ bot_status = {
 # ── Signal state — polled by MQL5 EA ──────────────────────────
 # EA polls GET /signal and reads this dict.
 current_signal = {
-    "action"    : "NONE",   # "BUY", "SELL", or "NONE"
-    "entry"     : 0.0,
-    "sl"        : 0.0,
-    "tp"        : 0.0,
-    "timestamp" : "—",      # IST time signal was generated
-    "consumed"  : False,    # EA sets this True after placing trade (via /signal/consumed)
+    "action"      : "NONE",   # "BUY", "SELL", or "NONE"
+    "entry"       : 0.0,
+    "sl"          : 0.0,
+    "tp"          : 0.0,
+    "timestamp"   : "—",      # IST time signal was generated
+    "signal_epoch": 0,        # UTC Unix timestamp — EA uses this to reject stale signals
+    "consumed"    : False,    # EA sets this True after placing trade (via /signal/consumed)
 }
 
 st = {
@@ -1043,12 +1045,13 @@ def bot_loop():
 # ══════════════════════════════════════════════════════════════
 def _update_signal(sig):
     """Write a new BUY/SELL signal — called from run_strategy()."""
-    current_signal["action"]    = sig["action"]
-    current_signal["entry"]     = sig["entry"]
-    current_signal["sl"]        = sig["sl"]
-    current_signal["tp"]        = sig["tp"]
-    current_signal["timestamp"] = ist_now().strftime("%H:%M:%S IST")
-    current_signal["consumed"]  = False
+    current_signal["action"]       = sig["action"]
+    current_signal["entry"]        = sig["entry"]
+    current_signal["sl"]           = sig["sl"]
+    current_signal["tp"]           = sig["tp"]
+    current_signal["timestamp"]    = ist_now().strftime("%H:%M:%S IST")
+    current_signal["signal_epoch"] = int(time.time())   # UTC epoch for staleness check
+    current_signal["consumed"]     = False
     log.info(f"📡 Signal updated → {sig['action']} entry={sig['entry']} sl={sig['sl']} tp={sig['tp']}")
     # Keep last 5 signals in history
     signal_history.append({"time": ist_now().strftime("%H:%M IST"),
@@ -1059,12 +1062,13 @@ def _update_signal(sig):
 
 def _clear_signal():
     """Reset signal to NONE after EA has consumed it."""
-    current_signal["action"]    = "NONE"
-    current_signal["entry"]     = 0.0
-    current_signal["sl"]        = 0.0
-    current_signal["tp"]        = 0.0
-    current_signal["timestamp"] = "—"
-    current_signal["consumed"]  = False
+    current_signal["action"]       = "NONE"
+    current_signal["entry"]        = 0.0
+    current_signal["sl"]           = 0.0
+    current_signal["tp"]           = 0.0
+    current_signal["timestamp"]    = "—"
+    current_signal["signal_epoch"] = 0
+    current_signal["consumed"]     = False
     log.info("📡 Signal cleared → NONE")
 
 # ══════════════════════════════════════════════════════════════
@@ -1151,28 +1155,75 @@ def api_s():
 def get_signal():
     """
     Returns the current trading signal as JSON.
-    The MQL5 EA calls this URL every tick.
-    Response:
-      { "action": "BUY"|"SELL"|"NONE",
-        "entry": float, "sl": float, "tp": float,
-        "timestamp": str, "consumed": bool }
+    Auto-expires signals older than MAX_SIGNAL_AGE_SEC so stale
+    signals from when the PC was off are never acted on.
     """
+    global trade_active
+
     # Track EA connectivity on every poll
     ea_status["last_seen"]   = ist_now().strftime("%H:%M:%S IST")
     ea_status["connected"]   = True
     ea_status["poll_count"] += 1
-    _sched["ea_disconnect_alerted"] = False   # reset disconnect flag
+    _sched["ea_disconnect_alerted"] = False
+
+    # Auto-expire stale signals — if signal is older than MAX_SIGNAL_AGE_SEC, clear it
+    if current_signal["action"] != "NONE" and current_signal["signal_epoch"] > 0:
+        age = int(time.time()) - current_signal["signal_epoch"]
+        if age > MAX_SIGNAL_AGE_SEC:
+            log.info(f"⏰ Signal expired (age={age}s > {MAX_SIGNAL_AGE_SEC}s) — auto-clearing")
+            tg(f"⏰ <b>Stale Signal Discarded</b>\n"
+               f"━━━━━━━━━━━━━━━━\n"
+               f"📌 {current_signal['action']} @ {current_signal['entry']} was {age}s old\n"
+               f"🔴 Too old to execute safely — cleared\n"
+               f"⏰ {ist_now().strftime('%H:%M IST')}")
+            _clear_signal()
+
     return jsonify(current_signal)
 
 # ── /signal/consumed  — EA calls after placing trade ──────────
 @flask_app.route("/signal/consumed", methods=["POST","GET"])
 def mark_consumed():
-    """
-    EA calls this after successfully placing the trade.
-    Marks signal as consumed so bot doesn't re-trigger.
-    """
+    """EA calls this after a trade attempt (success or fail). Marks signal consumed."""
     current_signal["consumed"] = True
     log.info("✅ Signal marked consumed by EA")
+    return jsonify({"ok": True})
+
+# ── /trade/open  — EA calls this after successfully placing a trade
+@flask_app.route("/trade/open", methods=["POST","GET"])
+def trade_open():
+    """
+    EA calls this after a trade is successfully placed.
+    Sets trade_active=True so the Python bot stops generating new signals.
+    """
+    global trade_active
+    action = current_signal["action"]
+    entry  = current_signal["entry"]
+    trade_active = True
+    current_signal["consumed"] = True
+    bot_status["last_signal"] = (
+        f"{action} @ {entry:.2f} [{ist_now().strftime('%H:%M IST')}]")
+    log.info(f"📌 Trade OPEN reported by EA — trade_active=True")
+    tg(f"✅ <b>TRADE PLACED (EA Confirmed)</b>\n"
+       f"━━━━━━━━━━━━━━━━\n"
+       f"📌 <b>{action} XAUUSD</b> @ {entry:.2f}\n"
+       f"🛑 SL: {current_signal['sl']:.2f}  🎯 TP: {current_signal['tp']:.2f}\n"
+       f"📦 Lots: 0.01\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}\n"
+       f"🤖 SMC+XAU Bot v7")
+    return jsonify({"ok": True})
+
+# ── /trade/close  — EA calls this when a trade is closed ──────
+@flask_app.route("/trade/close", methods=["POST","GET"])
+def trade_close():
+    """EA calls this when the trade closes (SL/TP hit). Resets trade_active."""
+    global trade_active
+    trade_active = False
+    _clear_signal()
+    log.info("📌 Trade CLOSE reported by EA — trade_active=False")
+    tg(f"📌 <b>Trade Closed</b>\n"
+       f"━━━━━━━━━━━━━━━━\n"
+       f"🔄 Bot now watching for next signal\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}")
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
