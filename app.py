@@ -62,6 +62,7 @@ CFG = {
     "atr_len"        : 14,
     "sl_atr_mult"    : 2.0,
     "rr_ratio"       : 3.0,
+    "min_sl_pts"     : 8.0,    # Deriv XAUUSD minimum stop distance (broker hard floor)
     "swing_len"      : 3,
     "choch_window"   : 5,
     "sweep_window"   : 10,
@@ -665,21 +666,22 @@ def run_strategy():
         esl=l-atr_v*CFG["sl_atr_mult"]; etp=c+abs(c-esl)*CFG["rr_ratio"]
         essl=h+atr_v*CFG["sl_atr_mult"]; estp=c-abs(essl-c)*CFG["rr_ratio"]
 
-        # Condition alerts (only during KZ, only if not spamming)
-        if ls>=5 and st["last_bull_alert"]<60 and not trade_active:
-            st["last_bull_alert"]=60; tg_warn("🟢 LONG",long_conds,ls,c,atr_v)
+        # Condition alerts — only SETUP FORMING (6/7+), no early warnings
         if ls>=6 and st["last_bull_alert"]<80 and not trade_active:
             st["last_bull_alert"]=80; tg_setup("🟢 LONG",long_conds,ls,c,atr_v,esl,etp)
-        if ss>=5 and st["last_bear_alert"]<60 and not trade_active:
-            st["last_bear_alert"]=60; tg_warn("🔴 SHORT",short_conds,ss,c,atr_v)
         if ss>=6 and st["last_bear_alert"]<80 and not trade_active:
             st["last_bear_alert"]=80; tg_setup("🔴 SHORT",short_conds,ss,c,atr_v,essl,estp)
 
-        if ls<5: st["last_bull_alert"]=0
-        if ss<5: st["last_bear_alert"]=0
+        if ls<6: st["last_bull_alert"]=0
+        if ss<6: st["last_bear_alert"]=0
 
         if all(long_conds.values()) and not trade_active:
             sl=l-atr_v*CFG["sl_atr_mult"]; tp=c+abs(c-sl)*CFG["rr_ratio"]
+            # Enforce minimum SL distance (Deriv rejects stops that are too tight)
+            min_dist = CFG["min_sl_pts"]
+            if (c - sl) < min_dist:
+                sl = round(c - min_dist, 2)
+                tp = round(c + min_dist * CFG["rr_ratio"], 2)
             st["last_bull_alert"]=100
             log.info(f"🚀 LONG entry:{c:.2f} sl:{sl:.2f} tp:{tp:.2f}")
             sig = {"action":"BUY","entry":c,"sl":round(sl,2),"tp":round(tp,2)}
@@ -688,6 +690,11 @@ def run_strategy():
 
         if all(short_conds.values()) and not trade_active:
             sl=h+atr_v*CFG["sl_atr_mult"]; tp=c-abs(sl-c)*CFG["rr_ratio"]
+            # Enforce minimum SL distance (Deriv rejects stops that are too tight)
+            min_dist = CFG["min_sl_pts"]
+            if (sl - c) < min_dist:
+                sl = round(c + min_dist, 2)
+                tp = round(c - min_dist * CFG["rr_ratio"], 2)
             st["last_bear_alert"]=100
             log.info(f"🔻 SHORT entry:{c:.2f} sl:{sl:.2f} tp:{tp:.2f}")
             sig = {"action":"SELL","entry":c,"sl":round(sl,2),"tp":round(tp,2)}
