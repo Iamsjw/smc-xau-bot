@@ -62,7 +62,7 @@ CFG = {
     "htf_ema"        : 50,
     "atr_len"        : 14,
     "sl_atr_mult"    : 2.0,
-    "rr_ratio"       : 3.0,
+    "rr_ratio"       : 2.5,
     "min_sl_pts"     : 8.0,    # Deriv XAUUSD minimum stop distance (broker hard floor)
     "swing_len"      : 3,
     "choch_window"   : 5,
@@ -160,6 +160,8 @@ ea_status = {
 }
 
 signal_history = []           # last 5 signals [{time, action, entry, sl, tp}]
+trade_log      = []           # all closed trades today [{num, action, entry, sl, tp, result, profit, time_open, time_close}]
+trade_counter  = 0            # increments on each new trade open
 
 _sched = {
     "heartbeat_date"       : None,   # date of last 9 AM heartbeat
@@ -275,87 +277,88 @@ def tg(msg, silent=False):
         return False
 
 def tg_started():
-    tg(f"🚀 <b>SMC+XAU Bot v7 Started</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📊 XAUUSD · 1m · 0.01 lots\n"
-       f"🛑 SL: {CFG['sl_atr_mult']}×ATR  🎯 TP: 1:{CFG['rr_ratio']}\n"
-       f"🟡 London : 12:30–15:30 IST\n"
-       f"🔵 NY     : 17:30–20:30 IST\n"
-       f"💡 API calls only during kill zones\n"
-       f"⏰ {ist_now().strftime('%H:%M:%S IST')}\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"Monitoring XAUUSD 🔍")
+    tg(f"🤖 <b>SMC+XAU Bot Started</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Symbol  : XAUUSD · 1m · 0.01 lots\n"
+       f"SL      : {CFG['sl_atr_mult']}× ATR  |  TP : 1:{CFG['rr_ratio']}\n"
+       f"London  : 12:30 – 15:30 IST\n"
+       f"NY      : 17:30 – 20:30 IST\n"
+       f"<code>────────────────────</code>\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}  |  Bot is live 🟢")
 
 def tg_kz_open(name):
-    tg(f"⏰ <b>Kill Zone Open</b> — {name}\n"
-       f"🔍 Strategy active\n"
-       f"📡 API calls: {api_calls['count']}/800\n"
-       f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
+    tg(f"🟢 <b>Kill Zone Open</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Session  : {name}\n"
+       f"API used : {api_calls['count']} / 800\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}  |  Scanning XAUUSD 🔍", silent=True)
 
 def tg_kz_close(name):
-    tg(f"🔕 <b>Kill Zone Closed</b>\n"
-       f"{name}\n"
-       f"📡 API calls used today: {api_calls['count']}/800\n"
-       f"💤 Bot sleeping\n"
-       f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
+    tg(f"🔴 <b>Kill Zone Closed</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Session  : {name}\n"
+       f"API used : {api_calls['count']} / 800\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}  |  Bot sleeping 💤", silent=True)
 
 def tg_warn(direction, conds, score, price, atr_v):
     met     = [k for k,v in conds.items() if v]
     missing = [k for k,v in conds.items() if not v]
-    tg(f"🟡 <b>EARLY WARNING — {direction}</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📊 XAUUSD @ <b>{price:.2f}</b>\n"
-       f"✅ <b>{score}/7 met</b> · ATR: {atr_v:.2f}\n"
-       f"\n✅ Met:\n" + "\n".join(f"  • {c}" for c in met) +
-       f"\n\n⏳ Waiting for:\n" + "\n".join(f"  • {c}" for c in missing) +
-       f"\n⏰ {ist_now().strftime('%H:%M IST')}")
+    tg(f"🟡 <b>Setup Forming  {direction}</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Price  : <b>{price:.2f}</b>  |  Score : {score}/7  |  ATR : {atr_v:.2f}\n"
+       f"<code>────────────────────</code>\n"
+       f"✅  {', '.join(met)}\n"
+       f"⏳  Needs: {', '.join(missing)}\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}")
 
 def tg_setup(direction, conds, score, price, atr_v, est_sl, est_tp):
     met     = [k for k,v in conds.items() if v]
     missing = [k for k,v in conds.items() if not v]
-    tg(f"🟠 <b>SETUP FORMING — {direction}</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📊 XAUUSD @ <b>{price:.2f}</b>\n"
-       f"✅ <b>{score}/7 met</b>\n"
-       f"\n✅ Met:\n" + "\n".join(f"  • {c}" for c in met) +
-       f"\n\n⏳ Waiting for:\n" + "\n".join(f"  • {c}" for c in missing) +
-       f"\n\n💡 Est SL: {est_sl:.2f}  TP: {est_tp:.2f}\n"
+    tg(f"🟠 <b>High-Probability Setup  {direction}</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Price  : <b>{price:.2f}</b>  |  Score : <b>{score}/7</b>\n"
+       f"Est SL : {est_sl:.2f}  |  Est TP : {est_tp:.2f}\n"
+       f"<code>────────────────────</code>\n"
+       f"✅  {', '.join(met)}\n"
+       f"⏳  Needs: {', '.join(missing)}\n"
        f"⏰ {ist_now().strftime('%H:%M IST')}")
 
 def tg_trade(signal):
-    tg(f"✅ <b>TRADE PLACED</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📌 <b>{signal['action']} XAUUSD</b>\n"
-       f"💰 Entry : <b>{signal['entry']:.2f}</b>\n"
-       f"🛑 SL    : <b>{signal['sl']:.2f}</b>\n"
-       f"🎯 TP    : <b>{signal['tp']:.2f}</b>\n"
-       f"📦 Lots  : 0.01\n"
-       f"📐 Risk  : {abs(signal['entry']-signal['sl']):.2f} pts\n"
-       f"🏆 Reward: {abs(signal['tp']-signal['entry']):.2f} pts\n"
-       f"⏰ {ist_now().strftime('%H:%M IST')}\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"🤖 SMC+XAU Bot v7")
+    direction = "🟢 LONG" if signal['action'] == "BUY" else "🔴 SHORT"
+    risk  = abs(signal['entry'] - signal['sl'])
+    rwrd  = abs(signal['tp']    - signal['entry'])
+    tg(f"✅ <b>Trade Placed  {direction}</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Entry  : <b>{signal['entry']:.2f}</b>\n"
+       f"SL     : {signal['sl']:.2f}  ({risk:.2f} pts)\n"
+       f"TP     : {signal['tp']:.2f}  ({rwrd:.2f} pts)\n"
+       f"Lots   : 0.01\n"
+       f"<code>────────────────────</code>\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}")
 
 def tg_err(title, detail, fix=""):
-    tg(f"❌ <b>{title}</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"🔴 {detail}\n"
-       + (f"💡 {fix}\n" if fix else "") +
-       f"⏰ {ist_now().strftime('%H:%M IST')}")
+    msg = (f"⚠️ <b>{title}</b>\n"
+           f"<code>────────────────────</code>\n"
+           f"{detail}\n")
+    if fix:
+        msg += f"💡 {fix}\n"
+    msg += f"⏰ {ist_now().strftime('%H:%M IST')}"
+    tg(msg)
 
 def tg_api_warn():
     tg(f"⚠️ <b>API Limit Warning</b>\n"
-       f"📡 Used: <b>{api_calls['count']}/800</b> today\n"
-       f"⏰ Resets at 5:30 AM IST\n"
-       f"💡 Approaching daily limit", silent=True)
+       f"<code>────────────────────</code>\n"
+       f"Used   : <b>{api_calls['count']} / 800</b>\n"
+       f"Resets : 05:30 IST daily\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
 
 def tg_api_exhausted():
     tg(f"🚨 <b>API Limit Reached — Bot Paused</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📡 Used: <b>{api_calls['count']}/800</b> calls\n"
-       f"🔴 No more candle fetches today\n"
-       f"⏰ Resets at <b>5:30 AM IST</b>\n"
-       f"💤 Bot will auto-resume after reset")
+       f"<code>────────────────────</code>\n"
+       f"Used   : <b>{api_calls['count']} / 800</b>\n"
+       f"Status : No more fetches today\n"
+       f"Resets : <b>05:30 IST</b>  |  Auto-resumes\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}")
 
 def tg_missing_creds():
     missing = [k for k,v in {
@@ -368,57 +371,109 @@ def tg_missing_creds():
         "TELEGRAM_CHAT_ID"  : TG_CHAT,
     }.items() if not v]
     if missing:
-        tg(f"⚠️ <b>Missing Railway Variables</b>\n" +
-           "\n".join(f"  • {m}" for m in missing) +
-           f"\n🔧 Railway → Service → Variables")
+        tg(f"⚠️ <b>Missing Environment Variables</b>\n"
+           f"<code>────────────────────</code>\n"
+           + "\n".join(f"  · {m}" for m in missing) +
+           f"\n💡 Railway → Service → Variables")
 
 def tg_heartbeat():
-    tg(f"💓 <b>Bot Alive — Daily Check</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📡 API calls: {api_calls['count']}/800\n"
-       f"📊 1m candles: {len(candles_1m)}\n"
-       f"🕐 {kz_countdown()}\n"
-       f"🤖 EA: {'✅ Connected' if ea_status['connected'] else '❌ Not seen yet'}\n"
+    tg(f"💓 <b>Bot Heartbeat</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"API     : {api_calls['count']} / 800\n"
+       f"Candles : {len(candles_1m)} × 1m\n"
+       f"Next KZ : {kz_countdown()}\n"
+       f"EA      : {'✅ Connected' if ea_status['connected'] else '❌ Not seen'}\n"
        f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
+
+def tg_trade_running(action, entry, sl, tp, trade_num):
+    direction = "🟢 LONG" if action == "BUY" else "🔴 SHORT"
+    risk  = abs(entry - sl)
+    rwrd  = abs(tp - entry)
+    rr    = round(rwrd / risk, 1) if risk > 0 else 0
+    tg(f"📊 <b>Trade #{trade_num} Running  {direction}</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Entry  : <b>{entry:.2f}</b>\n"
+       f"SL     : {sl:.2f}  (−{risk:.2f} pts)\n"
+       f"TP     : {tp:.2f}  (+{rwrd:.2f} pts)\n"
+       f"R:R    : 1 : {rr}  |  Lots : 0.01\n"
+       f"<code>────────────────────</code>\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}  |  Position active ⏳")
+
+def tg_trade_closed(trade_num, action, entry, sl, tp, result, profit):
+    direction = "LONG" if action == "BUY" else "SHORT"
+    pnl_sign  = "+" if profit >= 0 else ""
+    if result == "TP":
+        header  = f"✅ <b>Trade #{trade_num} — Take Profit Hit</b>"
+        outcome = "🎯 TP hit"
+    elif result == "SL":
+        header  = f"❌ <b>Trade #{trade_num} — Stop Loss Hit</b>"
+        outcome = "🛑 SL hit"
+    else:
+        header  = f"🔄 <b>Trade #{trade_num} — Closed</b>"
+        outcome = "Manual close"
+    tg(f"{header}\n"
+       f"<code>────────────────────</code>\n"
+       f"Side   : {direction} XAUUSD\n"
+       f"Entry  : {entry:.2f}  |  {outcome}\n"
+       f"P&amp;L : <b>{pnl_sign}{profit:.2f} USD</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}")
 
 def tg_daily_summary():
-    hist = signal_history[-5:] if signal_history else []
-    hist_text = "\n".join(f"  • {s['action']} @ {s['entry']} [{s['time']}]" for s in hist) or "  None today"
-    tg(f"📊 <b>Daily Summary</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📅 {ist_now().strftime('%d %b %Y')}\n"
-       f"📌 Trade active: <b>{'Yes 🔴' if trade_active else 'No'}</b>\n"
-       f"📡 API calls used: {api_calls['count']}/800\n"
-       f"📈 Signals generated:\n{hist_text}\n"
-       f"🤖 EA: {'✅ Connected' if ea_status['connected'] else '❌ Check MT5'}\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"🤖 SMC+XAU Bot v7")
+    today_str = ist_now().strftime('%d %b %Y')
+    if trade_log:
+        lines     = []
+        total_pnl = 0.0
+        wins = losses = 0
+        for t in trade_log:
+            sign  = "+" if t['profit'] >= 0 else ""
+            icon  = "✅" if t['result'] == "TP" else ("❌" if t['result'] == "SL" else "🔄")
+            side  = "L" if t['action'] == "BUY" else "S"
+            lines.append(f"  {icon} #{t['num']} {side} @ {t['entry']:.2f}  →  {sign}{t['profit']:.2f} USD")
+            total_pnl += t['profit']
+            if t['result'] == "TP": wins += 1
+            elif t['result'] == "SL": losses += 1
+        total    = wins + losses
+        win_pct  = f"{round(wins/total*100)}%" if total else "—"
+        net_sign = "+" if total_pnl >= 0 else ""
+        trades_text    = "\n".join(lines)
+        summary_footer = (f"\n<code>────────────────────</code>\n"
+                          f"Record : {wins}W / {losses}L  ({win_pct})\n"
+                          f"Net P&amp;L : <b>{net_sign}{total_pnl:.2f} USD</b>")
+    else:
+        trades_text    = "  No trades today"
+        summary_footer = ""
+    tg(f"📋 <b>Daily Summary — {today_str}</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"API used : {api_calls['count']} / 800\n"
+       f"EA       : {'✅ Connected' if ea_status['connected'] else '❌ Check MT5'}\n"
+       f"<code>────────────────────</code>\n"
+       f"Trades:\n{trades_text}{summary_footer}")
 
 def tg_market_reopen():
-    tg(f"🟢 <b>Market Open — New Week!</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📅 {ist_now().strftime('%A %d %b')}\n"
-       f"🥇 Gold trading has resumed\n"
-       f"🟡 London Kill Zone: 12:30 IST\n"
-       f"🔵 NY Kill Zone    : 17:30 IST\n"
-       f"📡 API calls reset: {api_calls['count']}/800\n"
-       f"🤖 SMC+XAU Bot v7 — Ready! 🚀")
+    tg(f"🟢 <b>Market Open — New Week</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Date    : {ist_now().strftime('%A, %d %b')}\n"
+       f"London  : 12:30 IST  |  NY : 17:30 IST\n"
+       f"API     : {api_calls['count']} / 800\n"
+       f"<code>────────────────────</code>\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}  |  Ready 🚀")
 
 def tg_friday_warning():
-    tg(f"⚠️ <b>Market Closes Soon — Friday</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📅 Gold closes ~03:30 IST Saturday\n"
-       f"📡 API calls today: {api_calls['count']}/800\n"
-       f"💤 Bot will sleep all weekend\n"
-       f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
+    tg(f"⏳ <b>Market Closes Today — Friday</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"Closes  : ~03:30 IST Saturday\n"
+       f"API     : {api_calls['count']} / 800 used\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}  |  Weekend mode soon 💤", silent=True)
 
 def tg_ea_disconnect():
-    tg(f"⚠️ <b>EA May Be Disconnected</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"🔴 No poll from MT5 EA in 10+ minutes\n"
+    tg(f"⚠️ <b>EA Disconnected</b>\n"
+       f"<code>────────────────────</code>\n"
+       f"No poll in 10+ minutes\n"
+       f"Last seen : {ea_status['last_seen']}\n"
+       f"<code>────────────────────</code>\n"
        f"💡 Check MetaTrader 5 is running\n"
-       f"💡 Check EA is attached to XAUUSD chart\n"
-       f"⏰ Last seen: {ea_status['last_seen']}")
+       f"💡 EA must be attached to XAUUSD")
 
 # ══════════════════════════════════════════════════════════════
 #  API CALL TRACKER — hard stop, no spam
@@ -1155,8 +1210,8 @@ def api_s():
 def get_signal():
     """
     Returns the current trading signal as JSON.
-    Auto-expires signals older than MAX_SIGNAL_AGE_SEC so stale
-    signals from when the PC was off are never acted on.
+    • While a trade is active, always returns NONE — EA should not receive new signals.
+    • Auto-expires signals older than MAX_SIGNAL_AGE_SEC.
     """
     global trade_active
 
@@ -1165,6 +1220,11 @@ def get_signal():
     ea_status["connected"]   = True
     ea_status["poll_count"] += 1
     _sched["ea_disconnect_alerted"] = False
+
+    # ── KEY FIX: If trade is running, always return NONE to EA ──────
+    if trade_active:
+        return jsonify({"action": "NONE", "entry": 0.0, "sl": 0.0, "tp": 0.0,
+                        "timestamp": "—", "signal_epoch": 0, "consumed": True})
 
     # Auto-expire stale signals — if signal is older than MAX_SIGNAL_AGE_SEC, clear it
     if current_signal["action"] != "NONE" and current_signal["signal_epoch"] > 0:
@@ -1194,36 +1254,85 @@ def trade_open():
     """
     EA calls this after a trade is successfully placed.
     Sets trade_active=True so the Python bot stops generating new signals.
+    Clears the current signal so EA stops receiving it immediately.
     """
-    global trade_active
+    global trade_active, trade_counter
     action = current_signal["action"]
     entry  = current_signal["entry"]
-    trade_active = True
-    current_signal["consumed"] = True
+    sl     = current_signal["sl"]
+    tp     = current_signal["tp"]
+
+    trade_active  = True
+    trade_counter += 1
+    trade_num = trade_counter
+
+    # Store open trade info for when it closes
+    bot_status["open_trade"] = {
+        "num": trade_num, "action": action, "entry": entry,
+        "sl": sl, "tp": tp, "time_open": ist_now().strftime("%H:%M IST")
+    }
     bot_status["last_signal"] = (
-        f"{action} @ {entry:.2f} [{ist_now().strftime('%H:%M IST')}]")
-    log.info(f"📌 Trade OPEN reported by EA — trade_active=True")
-    tg(f"✅ <b>TRADE PLACED (EA Confirmed)</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"📌 <b>{action} XAUUSD</b> @ {entry:.2f}\n"
-       f"🛑 SL: {current_signal['sl']:.2f}  🎯 TP: {current_signal['tp']:.2f}\n"
-       f"📦 Lots: 0.01\n"
-       f"⏰ {ist_now().strftime('%H:%M IST')}\n"
-       f"🤖 SMC+XAU Bot v7")
+        f"#{trade_num} {action} @ {entry:.2f} SL:{sl:.2f} TP:{tp:.2f} "
+        f"[{ist_now().strftime('%H:%M IST')}]")
+
+    # Clear the signal immediately — EA won't receive it again
+    _clear_signal()
+
+    log.info(f"📌 Trade #{trade_num} OPEN reported by EA — trade_active=True")
+    # Send running position message
+    tg_trade_running(action, entry, sl, tp, trade_num)
     return jsonify({"ok": True})
 
 # ── /trade/close  — EA calls this when a trade is closed ──────
+# EA can pass: ?profit=-10.50&result=SL  or  ?profit=10.50&result=TP
 @flask_app.route("/trade/close", methods=["POST","GET"])
 def trade_close():
-    """EA calls this when the trade closes (SL/TP hit). Resets trade_active."""
+    """
+    EA calls this when the trade closes (SL/TP hit). Resets trade_active.
+    Optional query params:
+      profit  : float P&L in account currency (e.g. -10.5 or +10.5)
+      result  : "SL" | "TP" | "manual"
+    """
+    from flask import request as flask_request
     global trade_active
+
+    profit_str = flask_request.args.get("profit", "0")
+    result_str = flask_request.args.get("result", "closed").upper()
+    try:
+        profit = float(profit_str)
+    except ValueError:
+        profit = 0.0
+
     trade_active = False
     _clear_signal()
-    log.info("📌 Trade CLOSE reported by EA — trade_active=False")
-    tg(f"📌 <b>Trade Closed</b>\n"
-       f"━━━━━━━━━━━━━━━━\n"
-       f"🔄 Bot now watching for next signal\n"
-       f"⏰ {ist_now().strftime('%H:%M IST')}")
+
+    # Retrieve open trade info
+    open_trade = bot_status.get("open_trade", {})
+    trade_num  = open_trade.get("num", trade_counter)
+    action     = open_trade.get("action", "—")
+    entry      = open_trade.get("entry", 0.0)
+    sl         = open_trade.get("sl", 0.0)
+    tp         = open_trade.get("tp", 0.0)
+    time_open  = open_trade.get("time_open", "—")
+
+    # Log closed trade
+    trade_log.append({
+        "num"       : trade_num,
+        "action"    : action,
+        "entry"     : entry,
+        "sl"        : sl,
+        "tp"        : tp,
+        "result"    : result_str,
+        "profit"    : profit,
+        "time_open" : time_open,
+        "time_close": ist_now().strftime("%H:%M IST"),
+    })
+    bot_status["open_trade"] = {}
+
+    log.info(f"📌 Trade #{trade_num} CLOSE reported by EA — result={result_str} profit={profit:.2f}")
+    tg_trade_closed(trade_num, action, entry, sl, tp, result_str, profit)
+    tg(f"🔄 <b>Bot Resumed</b> — watching for next signal\n"
+       f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
     return jsonify({"ok": True})
 
 if __name__ == "__main__":
