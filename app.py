@@ -57,16 +57,17 @@ IST           = timezone(timedelta(hours=5, minutes=30))
 # ══════════════════════════════════════════════════════════════
 CFG = {
     # Strategy (matches Pine Script exactly)
-    "fast_ema"       : 14,
-    "slow_ema"       : 140,
+    "fast_ema"       : 9,     # faster EMA for momentum (was 14)
+    "slow_ema"       : 50,    # less lag than 140 on 1m chart
     "htf_ema"        : 50,
     "atr_len"        : 14,
-    "sl_atr_mult"    : 2.0,
+    "sl_atr_mult"    : 1.5,   # tighter SL — anchored to swing level (was 2.0)
     "rr_ratio"       : 2.5,
-    "min_sl_pts"     : 8.0,    # Deriv XAUUSD minimum stop distance (broker hard floor)
-    "swing_len"      : 3,
-    "choch_window"   : 5,
-    "sweep_window"   : 10,
+    "min_sl_pts"     : 8.0,   # Deriv XAUUSD minimum stop distance
+    "swing_len"      : 5,     # stronger swing points, fewer fakes (was 3)
+    "choch_window"   : 3,     # CHoCH must be immediate — 3 bars max (was 5)
+    "sweep_window"   : 5,     # only trade fresh sweeps — 5 bars max (was 10)
+    "min_sweep_atr"  : 0.3,   # sweep must breach level by ≥0.3×ATR (new)
     "use_volume"     : True,
     "vol_lookback"   : 20,
     "range_mult"     : 1.1,
@@ -139,6 +140,7 @@ st = {
     # Strategy state
     "bull_sweep_bar" : -999, "bear_sweep_bar" : -999,
     "bull_choch_bar" : -999, "bear_choch_bar" : -999,
+    "bull_sweep_lvl" : 0.0,  "bear_sweep_lvl" : 0.0,   # swept level for SL anchoring
     "asian_high"     : None, "asian_low"      : None,
     "last_sh"        : None, "last_sl"        : None,
     "last_bull_alert": 0,    "last_bear_alert": 0,
@@ -677,31 +679,42 @@ def run_strategy():
         ph  = float(df["high"].iloc[-2]); pl  = float(df["low"].iloc[-2])
         po  = float(df["open"].iloc[-2]); pc  = float(df["close"].iloc[-2])
 
-        # Sweeps
+        # ── Sweeps — must breach level by minimum ATR amount (filters tiny fakeouts) ──
         sb = be = False
-        if st["asian_low"]  and l<st["asian_low"]:  sb=True
-        if st["asian_high"] and h>st["asian_high"]: be=True
-        if l<pdl: sb=True
-        if h>pdh: be=True
-        if lsl and not np.isnan(lsl) and l<lsl and c>lsl: sb=True
-        if lsh and not np.isnan(lsh) and h>lsh and c<lsh: be=True
+        min_sw = atr_v * CFG["min_sweep_atr"]
+        if st["asian_low"]  and l < st["asian_low"]  and (st["asian_low"]  - l) >= min_sw: sb = True
+        if st["asian_high"] and h > st["asian_high"] and (h - st["asian_high"]) >= min_sw: be = True
+        if l < pdl and (pdl - l) >= min_sw: sb = True
+        if h > pdh and (h - pdh) >= min_sw: be = True
+        # Swing sweeps — price must reject back inside the level (wick sweep)
+        if lsl and not np.isnan(lsl) and l < lsl and c > lsl and (lsl - l) >= min_sw: sb = True
+        if lsh and not np.isnan(lsh) and h > lsh and c < lsh and (h - lsh) >= min_sw: be = True
 
-        if sb: st["bull_sweep_bar"]=i; log.info("🔍 Bull sweep")
-        if be: st["bear_sweep_bar"]=i; log.info("🔍 Bear sweep")
+        # Track the swept level for SL anchoring
+        if sb:
+            st["bull_sweep_bar"] = i
+            st["bull_sweep_lvl"] = lsl if (lsl and not np.isnan(lsl) and l < lsl) else pdl
+            log.info(f"🔍 Bull sweep — level={st['bull_sweep_lvl']:.2f}")
+        if be:
+            st["bear_sweep_bar"] = i
+            st["bear_sweep_lvl"] = lsh if (lsh and not np.isnan(lsh) and h > lsh) else pdh
+            log.info(f"🔍 Bear sweep — level={st['bear_sweep_lvl']:.2f}")
 
-        rbs=(i-st["bull_sweep_bar"])<=CFG["sweep_window"]
-        rbe=(i-st["bear_sweep_bar"])<=CFG["sweep_window"]
+        rbs = (i - st["bull_sweep_bar"]) <= CFG["sweep_window"]
+        rbe = (i - st["bear_sweep_bar"]) <= CFG["sweep_window"]
 
-        bc =rbe and c>ph and c>o; brc=rbs and c<pl and c<o
-        if bc:  st["bull_choch_bar"]=i; log.info("🔄 Bull CHoCH")
-        if brc: st["bear_choch_bar"]=i; log.info("🔄 Bear CHoCH")
+        bc  = rbe and c > ph and c > o
+        brc = rbs and c < pl and c < o
+        if bc:  st["bull_choch_bar"] = i; log.info("🔄 Bull CHoCH")
+        if brc: st["bear_choch_bar"] = i; log.info("🔄 Bear CHoCH")
 
-        rbc =(i-st["bull_choch_bar"])<=CFG["choch_window"]
-        rbrc=(i-st["bear_choch_bar"])<=CFG["choch_window"]
+        rbc  = (i - st["bull_choch_bar"]) <= CFG["choch_window"]
+        rbrc = (i - st["bear_choch_bar"]) <= CFG["choch_window"]
 
-        body=abs(c-o); rng=h-l
-        be_l=c>o and c>po and o<pc and body>rng*0.5
-        be_s=c<o and c<po and o>pc and body>rng*0.5
+        body = abs(c - o); rng = h - l
+        # Stricter engulf: close must go BEYOND prior candle's open (full body engulf)
+        be_l = (c > o and c > po and body > rng * 0.5 and c > pc)   # bull: closes above prior open
+        be_s = (c < o and c < po and body > rng * 0.5 and c < pc)   # bear: closes below prior open
 
         long_conds  = {"HTF Bias (Bull)":bull_b,"Local Trend (Bull)":bull_t,
                        "Kill Zone":is_kz(),"Volume":high_v,
@@ -733,28 +746,34 @@ def run_strategy():
         if ss<6: st["last_bear_alert"]=0
 
         if all(long_conds.values()) and not trade_active:
-            sl=l-atr_v*CFG["sl_atr_mult"]; tp=c+abs(c-sl)*CFG["rr_ratio"]
-            # Enforce minimum SL distance (Deriv rejects stops that are too tight)
+            # ── SL anchored to swept swing low (not current bar low) ──
+            sweep_lvl = st.get("bull_sweep_lvl", l)
+            sl = sweep_lvl - atr_v * CFG["sl_atr_mult"]
+            tp = c + abs(c - sl) * CFG["rr_ratio"]
             min_dist = CFG["min_sl_pts"]
             if (c - sl) < min_dist:
                 sl = round(c - min_dist, 2)
                 tp = round(c + min_dist * CFG["rr_ratio"], 2)
-            st["last_bull_alert"]=100
-            log.info(f"🚀 LONG entry:{c:.2f} sl:{sl:.2f} tp:{tp:.2f}")
-            sig = {"action":"BUY","entry":c,"sl":round(sl,2),"tp":round(tp,2)}
+            sl = round(sl, 2); tp = round(tp, 2)
+            st["last_bull_alert"] = 100
+            log.info(f"🚀 LONG entry:{c:.2f} sl:{sl:.2f} tp:{tp:.2f} risk:{c-sl:.2f}pts")
+            sig = {"action": "BUY", "entry": c, "sl": sl, "tp": tp}
             _update_signal(sig)
             return sig
 
         if all(short_conds.values()) and not trade_active:
-            sl=h+atr_v*CFG["sl_atr_mult"]; tp=c-abs(sl-c)*CFG["rr_ratio"]
-            # Enforce minimum SL distance (Deriv rejects stops that are too tight)
+            # ── SL anchored to swept swing high (not current bar high + ATR) ──
+            sweep_lvl = st.get("bear_sweep_lvl", h)
+            sl = sweep_lvl + atr_v * CFG["sl_atr_mult"]
+            tp = c - abs(sl - c) * CFG["rr_ratio"]
             min_dist = CFG["min_sl_pts"]
             if (sl - c) < min_dist:
                 sl = round(c + min_dist, 2)
                 tp = round(c - min_dist * CFG["rr_ratio"], 2)
-            st["last_bear_alert"]=100
-            log.info(f"🔻 SHORT entry:{c:.2f} sl:{sl:.2f} tp:{tp:.2f}")
-            sig = {"action":"SELL","entry":c,"sl":round(sl,2),"tp":round(tp,2)}
+            sl = round(sl, 2); tp = round(tp, 2)
+            st["last_bear_alert"] = 100
+            log.info(f"🔻 SHORT entry:{c:.2f} sl:{sl:.2f} tp:{tp:.2f} risk:{sl-c:.2f}pts")
+            sig = {"action": "SELL", "entry": c, "sl": sl, "tp": tp}
             _update_signal(sig)
             return sig
 
