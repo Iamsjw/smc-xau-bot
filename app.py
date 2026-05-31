@@ -884,10 +884,22 @@ def place_trade(signal):
                     fix = next((v for k,v in guides.items() if k in err.lower()), "Check Deriv MT5 account")
                     tg_err("MT5 Order Failed", err, fix)
                 else:
+                    global trade_counter
                     oid = d.get("mt5_new_order",{}).get("order","—")
                     log.info(f"✅ Trade placed! Order: {oid}")
                     result["status"]="placed"; result["order"]=oid
                     trade_active = True
+                    trade_counter += 1
+                    bot_status["open_trade"] = {
+                        "num": trade_counter,
+                        "action": signal["action"],
+                        "entry": signal["entry"],
+                        "sl": signal["sl"],
+                        "tp": signal["tp"],
+                        "time_open": ist_now().strftime("%H:%M IST"),
+                        "open_epoch": int(time.time()),
+                        "is_simulated": False
+                    }
                     bot_status["last_signal"] = (
                         f"{signal['action']} @ {signal['entry']:.2f} "
                         f"SL:{signal['sl']:.2f} TP:{signal['tp']:.2f} "
@@ -935,6 +947,120 @@ def place_trade(signal):
         result["status"]="timeout"
 
     return result
+
+
+# ══════════════════════════════════════════════════════════════
+#  TRADE PERFORMANCE SIMULATOR (TP/SL fallback/dry run)
+# ══════════════════════════════════════════════════════════════
+def check_active_trade_performance():
+    global trade_active
+    open_trade = bot_status.get("open_trade")
+    if not trade_active or not open_trade:
+        return
+
+    is_simulated = open_trade.get("is_simulated", False)
+    ea_connected = ea_status.get("connected", False)
+
+    # If the trade is live and the EA is connected, let the EA handle the trade closure
+    if not is_simulated and ea_connected:
+        return
+
+    if not candles_1m:
+        return
+
+    open_epoch = open_trade.get("open_epoch", 0)
+    action     = open_trade.get("action")
+    entry      = open_trade.get("entry", 0.0)
+    sl         = open_trade.get("sl", 0.0)
+    tp         = open_trade.get("tp", 0.0)
+    trade_num  = open_trade.get("num", 0)
+
+    hit_tp = False
+    hit_sl = False
+    close_price = 0.0
+    hit_time = None
+
+    # Check candles closed after or near the open epoch
+    for c in list(candles_1m):
+        if c["epoch"] < open_epoch - 30:
+            continue
+
+        high = c["h"]
+        low  = c["l"]
+
+        if action == "BUY":
+            # SL hit check first (conservative)
+            if low <= sl:
+                hit_sl = True
+                close_price = sl
+                hit_time = c["epoch"]
+                break
+            elif high >= tp:
+                hit_tp = True
+                close_price = tp
+                hit_time = c["epoch"]
+                break
+        elif action == "SELL":
+            # SL hit check first (conservative)
+            if high >= sl:
+                hit_sl = True
+                close_price = sl
+                hit_time = c["epoch"]
+                break
+            elif low <= tp:
+                hit_tp = True
+                close_price = tp
+                hit_time = c["epoch"]
+                break
+
+    if hit_tp or hit_sl:
+        result_str = "TP" if hit_tp else "SL"
+        profit = (close_price - entry) if action == "BUY" else (entry - close_price)
+        # Lot size is 0.01; XAUUSD contract is 100oz. So 0.01 lots = 1oz.
+        # Profit in USD = point change.
+        profit = round(profit, 2)
+
+        log.info(f"🔮 Simulated Trade #{trade_num} hit {result_str} at price {close_price:.2f}, profit: {profit:.2f} USD")
+
+        # Update state
+        trade_active = False
+        bot_status["open_trade"] = {}
+        _clear_signal()
+
+        # Log closed trade
+        trade_log.append({
+            "num"       : trade_num,
+            "action"    : action,
+            "entry"     : entry,
+            "sl"        : sl,
+            "tp"        : tp,
+            "result"    : result_str,
+            "profit"    : profit,
+            "time_open" : open_trade.get("time_open", "—"),
+            "time_close": datetime.fromtimestamp(hit_time, IST).strftime("%H:%M IST") if hit_time else ist_now().strftime("%H:%M IST"),
+        })
+
+        header_prefix = "🔮 [Simulated] " if is_simulated else "⚠️ [EA Offline Fallback] "
+        direction = "LONG" if action == "BUY" else "SHORT"
+        pnl_sign  = "+" if profit >= 0 else ""
+        if result_str == "TP":
+            header  = f"{header_prefix}<b>Trade #{trade_num} — Take Profit Hit</b>"
+            outcome = "🎯 TP hit"
+        else:
+            header  = f"{header_prefix}<b>Trade #{trade_num} — Stop Loss Hit</b>"
+            outcome = "🛑 SL hit"
+
+        tg(f"{header}\n"
+           f"<code>────────────────────</code>\n"
+           f"Side   : {direction} XAUUSD\n"
+           f"Entry  : {entry:.2f}  |  {outcome}\n"
+           f"P&amp;L : <b>{pnl_sign}{profit:.2f} USD</b> (Est)\n"
+           f"<code>────────────────────</code>\n"
+           f"⏰ {ist_now().strftime('%H:%M IST')}")
+
+        tg(f"🔄 <b>Bot Resumed</b> — watching for next signal\n"
+           f"⏰ {ist_now().strftime('%H:%M IST')}", silent=True)
+
 
 # ══════════════════════════════════════════════════════════════
 #  BOT LOOP — efficient, KZ-aware
@@ -1061,42 +1187,68 @@ def bot_loop():
             if not kz_active and not is_warmup_window():
                 st["warmed_up"] = False
 
-            # ── OUTSIDE kill zone — just sleep, NO API calls ──
-            if not kz_active:
+            # ── OUTSIDE kill zone — just sleep, NO API calls (unless trade is active) ──
+            if not kz_active and not trade_active:
                 log.info("💤 Outside kill zone — no API calls")
                 time.sleep(CFG["check_every_sec"])
                 bot_status["consecutive_err"] = 0
                 continue
 
-            # ── INSIDE kill zone — fetch + strategy ──
+            # ── INSIDE kill zone or tracking active trade ──
             td_fetch_latest()
             bot_status["candles_1m"] = len(candles_1m)
 
-            # Refresh 1H at top of hour
-            if now.minute == 0:
+            # Check performance of any active simulated/offline trade
+            check_active_trade_performance()
+
+            # Refresh 1H at top of hour (only if in KZ)
+            if kz_active and now.minute == 0:
                 td_fetch("1h", CFG["htf_limit"], candles_1h)
                 log.info("🔄 1H candles refreshed")
 
-            # Run strategy
-            sig = run_strategy()
+            # Run strategy (only if in KZ)
+            if kz_active:
+                sig = run_strategy()
 
-            if sig:
-                if DERIV_TOKEN and MT5_LOGIN and DERIV_ACCT and DERIV_APP_ID:
-                    log.info(f"🎯 {sig['action']} — placing trade via new OTP flow...")
-                    res = place_trade(sig)
-                    log.info(f"📋 Result: {res}")
-                    bot_status["error"] = str(res.get("detail","—"))
-                else:
-                    missing = [k for k,v in {
-                        "DERIV_API_TOKEN":DERIV_TOKEN,"MT5_LOGIN":MT5_LOGIN,
-                        "DERIV_ACCOUNT_ID":DERIV_ACCT,"DERIV_APP_ID_NEW":DERIV_APP_ID
-                    }.items() if not v]
-                    log.info(f"🎯 DRY RUN {sig['action']} @ {sig['entry']:.2f} "
-                             f"[Missing: {', '.join(missing)}]")
-                    bot_status["last_signal"] = f"DRY {sig['action']} @ {sig['entry']:.2f}"
-                    tg(f"⚠️ <b>Signal — No Trade (Missing credentials)</b>\n"
-                       f"📌 {sig['action']} @ {sig['entry']:.2f}\n"
-                       f"Missing: {', '.join(missing)}")
+                if sig:
+                    if DERIV_TOKEN and MT5_LOGIN and DERIV_ACCT and DERIV_APP_ID:
+                        log.info(f"🎯 {sig['action']} — placing trade via new OTP flow...")
+                        res = place_trade(sig)
+                        log.info(f"📋 Result: {res}")
+                        bot_status["error"] = str(res.get("detail","—"))
+                    else:
+                        missing = [k for k,v in {
+                            "DERIV_API_TOKEN":DERIV_TOKEN,"MT5_LOGIN":MT5_LOGIN,
+                            "DERIV_ACCOUNT_ID":DERIV_ACCT,"DERIV_APP_ID_NEW":DERIV_APP_ID
+                        }.items() if not v]
+                        log.info(f"🎯 DRY RUN {sig['action']} @ {sig['entry']:.2f} "
+                                 f"[Missing: {', '.join(missing)}]")
+                        
+                        trade_active = True
+                        trade_counter += 1
+                        bot_status["open_trade"] = {
+                            "num": trade_counter,
+                            "action": sig["action"],
+                            "entry": sig["entry"],
+                            "sl": sig["sl"],
+                            "tp": sig["tp"],
+                            "time_open": ist_now().strftime("%H:%M IST"),
+                            "open_epoch": int(time.time()),
+                            "is_simulated": True
+                        }
+                        bot_status["last_signal"] = (
+                            f"SIM {sig['action']} @ {sig['entry']:.2f} "
+                            f"SL:{sig['sl']:.2f} TP:{sig['tp']:.2f} "
+                            f"[{ist_now().strftime('%H:%M IST')}]")
+                        
+                        tg(f"🔮 <b>Simulated Trade #{trade_counter} Opened (Dry Run)</b>\n"
+                           f"<code>────────────────────</code>\n"
+                           f"Signal : {sig['action']} @ {sig['entry']:.2f}\n"
+                           f"SL     : {sig['sl']:.2f}  |  TP : {sig['tp']:.2f}\n"
+                           f"Missing: {', '.join(missing)}\n"
+                           f"⏰ {ist_now().strftime('%H:%M IST')}")
+                        
+                        tg_trade_running(sig["action"], sig["entry"], sig["sl"], sig["tp"], trade_counter)
 
             bot_status["consecutive_err"] = 0
 
@@ -1281,6 +1433,23 @@ def trade_open():
     sl     = current_signal["sl"]
     tp     = current_signal["tp"]
 
+    # Check if there is an active simulated trade that matches the action
+    open_trade = bot_status.get("open_trade", {})
+    if open_trade and open_trade.get("is_simulated", False):
+        if open_trade.get("action") == action and abs(open_trade.get("entry", 0) - entry) < 0.5:
+            # Upgrade simulated trade to live trade because the EA successfully opened it!
+            log.info("📌 EA connected and confirmed trade open. Upgrading simulated trade to live.")
+            open_trade["is_simulated"] = False
+            _clear_signal()
+            return jsonify({"ok": True})
+
+    # If already opened (from place_trade), don't duplicate
+    if open_trade and not open_trade.get("is_simulated", False):
+        if open_trade.get("action") == action and abs(open_trade.get("entry", 0) - entry) < 0.5:
+            log.info("📌 Trade already open in state (from place_trade), skipping duplicate open notification")
+            _clear_signal()
+            return jsonify({"ok": True})
+
     trade_active  = True
     trade_counter += 1
     trade_num = trade_counter
@@ -1288,7 +1457,8 @@ def trade_open():
     # Store open trade info for when it closes
     bot_status["open_trade"] = {
         "num": trade_num, "action": action, "entry": entry,
-        "sl": sl, "tp": tp, "time_open": ist_now().strftime("%H:%M IST")
+        "sl": sl, "tp": tp, "time_open": ist_now().strftime("%H:%M IST"),
+        "open_epoch": int(time.time()), "is_simulated": False
     }
     bot_status["last_signal"] = (
         f"#{trade_num} {action} @ {entry:.2f} SL:{sl:.2f} TP:{tp:.2f} "
@@ -1315,6 +1485,13 @@ def trade_close():
     from flask import request as flask_request
     global trade_active
 
+    # Retrieve open trade info
+    open_trade = bot_status.get("open_trade", {})
+    if not open_trade:
+        # The trade might have already been closed by the simulated fallback
+        log.info("📌 Trade close requested by EA, but trade is already closed in server state. Skipping.")
+        return jsonify({"ok": True, "message": "Already closed"})
+
     profit_str = flask_request.args.get("profit", "0")
     result_str = flask_request.args.get("result", "closed").upper()
     try:
@@ -1325,8 +1502,6 @@ def trade_close():
     trade_active = False
     _clear_signal()
 
-    # Retrieve open trade info
-    open_trade = bot_status.get("open_trade", {})
     trade_num  = open_trade.get("num", trade_counter)
     action     = open_trade.get("action", "—")
     entry      = open_trade.get("entry", 0.0)
