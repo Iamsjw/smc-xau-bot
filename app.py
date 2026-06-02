@@ -157,6 +157,7 @@ st = {
 # ── Enhanced monitoring state ──────────────────────────────────
 ea_status = {
     "last_seen"  : "Never",   # IST time EA last polled /signal
+    "last_seen_epoch": 0,      # epoch time of last poll
     "connected"  : False,     # True if polled within last 10 min
     "poll_count" : 0,         # total /signal calls since start
 }
@@ -959,11 +960,10 @@ def check_active_trade_performance():
         return
 
     is_simulated = open_trade.get("is_simulated", False)
-    ea_connected = ea_status.get("connected", False)
-
-    # If the trade is live and the EA is connected, let the EA handle the trade closure
-    if not is_simulated and ea_connected:
-        return
+    
+    # Calculate real-time EA connection status: must be marked connected AND polled within last 30 seconds
+    last_seen_epoch = ea_status.get("last_seen_epoch", 0)
+    ea_connected = ea_status.get("connected", False) and (time.time() - last_seen_epoch <= 30)
 
     if not candles_1m:
         return
@@ -1020,7 +1020,8 @@ def check_active_trade_performance():
         # Profit in USD = point change.
         profit = round(profit, 2)
 
-        log.info(f"🔮 Simulated Trade #{trade_num} hit {result_str} at price {close_price:.2f}, profit: {profit:.2f} USD")
+        mode_str = "Simulated" if is_simulated else ("Offline Fallback" if not ea_connected else "Auto Check")
+        log.info(f"🔮 {mode_str} Trade #{trade_num} hit {result_str} at price {close_price:.2f}, profit: {profit:.2f} USD")
 
         # Update state
         trade_active = False
@@ -1040,7 +1041,12 @@ def check_active_trade_performance():
             "time_close": datetime.fromtimestamp(hit_time, IST).strftime("%H:%M IST") if hit_time else ist_now().strftime("%H:%M IST"),
         })
 
-        header_prefix = "🔮 [Simulated] " if is_simulated else "⚠️ [EA Offline Fallback] "
+        if is_simulated:
+            header_prefix = "🔮 [Simulated] "
+        elif not ea_connected:
+            header_prefix = "⚠️ [EA Offline Fallback] "
+        else:
+            header_prefix = "✅ [Auto Check] "
         direction = "LONG" if action == "BUY" else "SHORT"
         pnl_sign  = "+" if profit >= 0 else ""
         if result_str == "TP":
@@ -1137,21 +1143,18 @@ def bot_loop():
             if dow == 0:
                 _sched["reopen_alerted"] = False
 
-            # EA disconnect alert — only during kill zone, only once
-            if is_kz() and ea_status["last_seen"] != "Never":
-                try:
-                    ls = datetime.strptime(ea_status["last_seen"], "%H:%M:%S IST")
-                    ls = now.replace(hour=ls.hour, minute=ls.minute, second=ls.second)
-                    if (now - ls).total_seconds() > 600:
-                        ea_status["connected"] = False
-                        if not _sched["ea_disconnect_alerted"]:
-                            _sched["ea_disconnect_alerted"] = True
-                            tg_ea_disconnect()
-                    else:
-                        ea_status["connected"] = True
-                        _sched["ea_disconnect_alerted"] = False
-                except Exception:
-                    pass
+            # EA connection monitoring (always active, not just in KZ)
+            if ea_status.get("last_seen_epoch", 0) > 0:
+                elapsed = time.time() - ea_status["last_seen_epoch"]
+                if elapsed > 600:
+                    ea_status["connected"] = False
+                    # Only send Telegram disconnect alert during Kill Zones
+                    if is_kz() and not _sched["ea_disconnect_alerted"]:
+                        _sched["ea_disconnect_alerted"] = True
+                        tg_ea_disconnect()
+                else:
+                    ea_status["connected"] = True
+                    _sched["ea_disconnect_alerted"] = False
             # ─────────────────────────────────────────────────────
 
             kz  = kz_name()
@@ -1388,6 +1391,7 @@ def get_signal():
 
     # Track EA connectivity on every poll
     ea_status["last_seen"]   = ist_now().strftime("%H:%M:%S IST")
+    ea_status["last_seen_epoch"] = time.time()
     ea_status["connected"]   = True
     ea_status["poll_count"] += 1
     _sched["ea_disconnect_alerted"] = False
