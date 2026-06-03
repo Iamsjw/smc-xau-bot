@@ -960,6 +960,7 @@ def check_active_trade_performance():
         return
 
     is_simulated = open_trade.get("is_simulated", False)
+    is_offline_fallback = open_trade.get("offline_fallback", False)
     
     # Calculate real-time EA connection status: must be marked connected AND polled within last 30 seconds
     last_seen_epoch = ea_status.get("last_seen_epoch", 0)
@@ -1020,7 +1021,7 @@ def check_active_trade_performance():
         # Profit in USD = point change.
         profit = round(profit, 2)
 
-        mode_str = "Simulated" if is_simulated else ("Offline Fallback" if not ea_connected else "Auto Check")
+        mode_str = "Offline Fallback" if (is_offline_fallback or not ea_connected) else ("Simulated" if is_simulated else "Auto Check")
         log.info(f"🔮 {mode_str} Trade #{trade_num} hit {result_str} at price {close_price:.2f}, profit: {profit:.2f} USD")
 
         # Update state
@@ -1041,10 +1042,10 @@ def check_active_trade_performance():
             "time_close": datetime.fromtimestamp(hit_time, IST).strftime("%H:%M IST") if hit_time else ist_now().strftime("%H:%M IST"),
         })
 
-        if is_simulated:
-            header_prefix = "🔮 [Simulated] "
-        elif not ea_connected:
+        if is_offline_fallback or not ea_connected:
             header_prefix = "⚠️ [EA Offline Fallback] "
+        elif is_simulated:
+            header_prefix = "🔮 [Simulated] "
         else:
             header_prefix = "✅ [Auto Check] "
         direction = "LONG" if action == "BUY" else "SHORT"
@@ -1072,7 +1073,7 @@ def check_active_trade_performance():
 #  BOT LOOP — efficient, KZ-aware
 # ══════════════════════════════════════════════════════════════
 def bot_loop():
-    global trade_active
+    global trade_active, trade_counter
     log.info("🤖 SMC+XAU Bot v7 starting...")
     tg_missing_creds()
 
@@ -1214,44 +1215,67 @@ def bot_loop():
                 sig = run_strategy()
 
                 if sig:
+                    placed = False
+                    live_attempted = False
                     if DERIV_TOKEN and MT5_LOGIN and DERIV_ACCT and DERIV_APP_ID:
+                        live_attempted = True
                         log.info(f"🎯 {sig['action']} — placing trade via new OTP flow...")
                         res = place_trade(sig)
                         log.info(f"📋 Result: {res}")
                         bot_status["error"] = str(res.get("detail","—"))
-                    else:
-                        missing = [k for k,v in {
-                            "DERIV_API_TOKEN":DERIV_TOKEN,"MT5_LOGIN":MT5_LOGIN,
-                            "DERIV_ACCOUNT_ID":DERIV_ACCT,"DERIV_APP_ID_NEW":DERIV_APP_ID
-                        }.items() if not v]
-                        log.info(f"🎯 DRY RUN {sig['action']} @ {sig['entry']:.2f} "
-                                 f"[Missing: {', '.join(missing)}]")
+                        if res.get("status") == "placed":
+                            placed = True
+                    
+                    if not placed:
+                        # Fall back to simulated/offline trade tracking if EA is offline or dry-run
+                        last_seen_epoch = ea_status.get("last_seen_epoch", 0)
+                        ea_connected = ea_status.get("connected", False) and (time.time() - last_seen_epoch <= 30)
                         
-                        trade_active = True
-                        trade_counter += 1
-                        bot_status["open_trade"] = {
-                            "num": trade_counter,
-                            "action": sig["action"],
-                            "entry": sig["entry"],
-                            "sl": sig["sl"],
-                            "tp": sig["tp"],
-                            "time_open": ist_now().strftime("%H:%M IST"),
-                            "open_epoch": int(time.time()),
-                            "is_simulated": True
-                        }
-                        bot_status["last_signal"] = (
-                            f"SIM {sig['action']} @ {sig['entry']:.2f} "
-                            f"SL:{sig['sl']:.2f} TP:{sig['tp']:.2f} "
-                            f"[{ist_now().strftime('%H:%M IST')}]")
-                        
-                        tg(f"🔮 <b>Simulated Trade #{trade_counter} Opened (Dry Run)</b>\n"
-                           f"<code>────────────────────</code>\n"
-                           f"Signal : {sig['action']} @ {sig['entry']:.2f}\n"
-                           f"SL     : {sig['sl']:.2f}  |  TP : {sig['tp']:.2f}\n"
-                           f"Missing: {', '.join(missing)}\n"
-                           f"⏰ {ist_now().strftime('%H:%M IST')}")
-                        
-                        tg_trade_running(sig["action"], sig["entry"], sig["sl"], sig["tp"], trade_counter)
+                        if not ea_connected or not live_attempted:
+                            trade_active = True
+                            trade_counter += 1
+                            bot_status["open_trade"] = {
+                                "num": trade_counter,
+                                "action": sig["action"],
+                                "entry": sig["entry"],
+                                "sl": sig["sl"],
+                                "tp": sig["tp"],
+                                "time_open": ist_now().strftime("%H:%M IST"),
+                                "open_epoch": int(time.time()),
+                                "is_simulated": True,
+                                "offline_fallback": live_attempted
+                            }
+                            
+                            if not live_attempted:
+                                missing = [k for k,v in {
+                                    "DERIV_API_TOKEN":DERIV_TOKEN,"MT5_LOGIN":MT5_LOGIN,
+                                    "DERIV_ACCOUNT_ID":DERIV_ACCT,"DERIV_APP_ID_NEW":DERIV_APP_ID
+                                }.items() if not v]
+                                bot_status["last_signal"] = (
+                                    f"SIM {sig['action']} @ {sig['entry']:.2f} "
+                                    f"SL:{sig['sl']:.2f} TP:{sig['tp']:.2f} "
+                                    f"[{ist_now().strftime('%H:%M IST')}]")
+                                
+                                tg(f"🔮 <b>Simulated Trade #{trade_counter} Opened (Dry Run)</b>\n"
+                                   f"<code>────────────────────</code>\n"
+                                   f"Signal : {sig['action']} @ {sig['entry']:.2f}\n"
+                                   f"SL     : {sig['sl']:.2f}  |  TP : {sig['tp']:.2f}\n"
+                                   f"Missing: {', '.join(missing)}\n"
+                                   f"⏰ {ist_now().strftime('%H:%M IST')}")
+                            else:
+                                bot_status["last_signal"] = (
+                                    f"OFFLINE {sig['action']} @ {sig['entry']:.2f} "
+                                    f"SL:{sig['sl']:.2f} TP:{sig['tp']:.2f} "
+                                    f"[{ist_now().strftime('%H:%M IST')}]")
+                                
+                                tg(f"⚠️ <b>Offline Fallback Trade #{trade_counter} Opened (Simulated)</b>\n"
+                                   f"<code>────────────────────</code>\n"
+                                   f"Signal : {sig['action']} @ {sig['entry']:.2f}\n"
+                                   f"SL     : {sig['sl']:.2f}  |  TP : {sig['tp']:.2f}\n"
+                                   f"Reason : EA is offline & Live placement failed ({bot_status['error']})\n"
+                                   f"⏰ {ist_now().strftime('%H:%M IST')}")
+                            
+                            tg_trade_running(sig["action"], sig["entry"], sig["sl"], sig["tp"], trade_counter)
 
             bot_status["consecutive_err"] = 0
 
